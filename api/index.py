@@ -263,11 +263,22 @@ def _handle_quotes(form):
         for i in instruments
     ]
 
+    reinit_token = None
+    candidate_kwargs = {}
+    client = None
     try:
+        # The quotes()-level session_token/sid/server_id kwargs alone don't
+        # seem to be enough to authenticate this fresh client instance - the
+        # SDK appears to rely on its own internal state, which is normally
+        # populated by a real login. access_token is the constructor's
+        # documented way to reattach an already-authenticated session
+        # without repeating the full login flow, so use whichever token we
+        # captured at login time for it.
+        reinit_token = session.get("access_token") or session.get("session_token")
         client = NeoAPI(
             consumer_key=consumer_key,
             environment=os.environ.get("KOTAK_ENVIRONMENT", "prod"),
-            access_token=None,
+            access_token=reinit_token,
             neo_fin_key=None,
         )
         # Different neo_api_client releases accept different keyword arguments
@@ -289,15 +300,18 @@ def _handle_quotes(form):
         candidate_kwargs = {k: v for k, v in candidate_kwargs.items() if v is not None}
         response = client.quotes(**_supported_kwargs(client.quotes, candidate_kwargs))
     except Exception as exc:
-        try:
-            accepted = list(inspect.signature(client.quotes).parameters.keys())
-        except Exception:
-            accepted = None
+        accepted = None
+        if client is not None:
+            try:
+                accepted = list(inspect.signature(client.quotes).parameters.keys())
+            except Exception:
+                accepted = None
         return 200, {
             "ok": False,
             "error": f"Quote fetch failed: {exc}",
             "debug": {
                 "quotes_accepted_params": accepted,
+                "reinit_token_used": _mask(reinit_token) if reinit_token else None,
                 "session_received": {k: _mask(v) for k, v in session.items()},
                 "kwargs_sent": {k: _mask(v) for k, v in candidate_kwargs.items() if k != "instrument_tokens"},
             },

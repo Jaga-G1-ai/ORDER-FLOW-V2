@@ -22,6 +22,13 @@ poll quotes continuously the way a Flask/Render app could. Instead:
     the browser on every call and passes it into `client.quotes(...)`, which
     Kotak Neo supports without repeating the full login. The browser itself
     drives the polling loop (every 5s) by calling this endpoint repeatedly.
+- **The frontend lives in `public/index.html`, not the project root.**
+  Once Vercel detects a Python entrypoint, it *routes every request to it*
+  — including `/` — so a root-level `index.html` would never be reached; it'd
+  always lose to the Python catch-all. Files under `public/**` are the one
+  exception Vercel serves directly, bypassing the function, which is why the
+  frontend has to live there to actually show up instead of the function's
+  JSON response.
 - **History** is stored in the browser's `localStorage`, not on the server
   (Vercel functions have no persistent disk), so "later viewing" survives
   page reloads and browser restarts on that machine. Export to CSV any time.
@@ -30,10 +37,11 @@ poll quotes continuously the way a Flask/Render app could. Instead:
 
 ## Repo layout
 ```
-├── index.html          # static frontend (login form + live dashboard + history)
+├── public/
+│   └── index.html       # static frontend (login form + live dashboard + history)
 ├── api/
 │   └── index.py          # single Vercel entrypoint: POST /api/index {action, ...}
-├── requirements.txt
+├── pyproject.toml
 ├── vercel.json
 └── .env.example
 ```
@@ -55,8 +63,9 @@ git push -u origin main
    Project Settings → Environment Variables if you want the login form's
    consumer-key field to default to your key. Everything else (mobile, UCC,
    TOTP, MPIN) is entered in the browser per session, never stored server-side.
-4. Deploy. Vercel auto-detects the Python files under `api/` and serves
-   `index.html` as the static site root.
+4. Deploy. Vercel auto-detects `api/index.py` as the Python entrypoint and
+   serves everything under `public/` (i.e. `public/index.html`) directly as
+   static content.
 
 ## 3. Use it
 1. Open the deployed URL → sign in with Consumer Key, mobile, UCC, TOTP, MPIN.

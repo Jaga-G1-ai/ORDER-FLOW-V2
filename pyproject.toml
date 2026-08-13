@@ -1,5 +1,5 @@
 [project]
-name = "order-flow-v2"
+name = "dashboard-buy-sell"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [

@@ -89,11 +89,11 @@ def _extract_totals(quote):
     """
     total_bid, total_ask, ltp = None, None, None
 
-    for k in ("tbq", "totalBuyQuantity", "total_buy_quantity", "buy_quantity", "totBuyQty", "total_buy"):
+    for k in ("total_buy", "tbq", "totalBuyQuantity", "total_buy_quantity", "buy_quantity", "totBuyQty"):
         if k in quote:
             total_bid = _to_num(quote[k])
             break
-    for k in ("tsq", "totalSellQuantity", "total_sell_quantity", "sell_quantity", "totSellQty", "total_sell"):
+    for k in ("total_sell", "tsq", "totalSellQuantity", "total_sell_quantity", "sell_quantity", "totSellQty"):
         if k in quote:
             total_ask = _to_num(quote[k])
             break
@@ -102,9 +102,13 @@ def _extract_totals(quote):
     if isinstance(depth, dict):
         buy_levels = depth.get("buy") or depth.get("Buy") or []
         sell_levels = depth.get("sell") or depth.get("Sell") or []
-        if total_bid is None and buy_levels:
+        # Match the reference app: fall back to summing depth levels not
+        # just when the field was absent, but also when it came back falsy
+        # (0/None) - a real depth-level sum is more trustworthy than a
+        # zeroed-out total field.
+        if not total_bid and buy_levels:
             total_bid = sum(_to_num(l.get("quantity", l.get("qty", 0))) for l in buy_levels)
-        if total_ask is None and sell_levels:
+        if not total_ask and sell_levels:
             total_ask = sum(_to_num(l.get("quantity", l.get("qty", 0))) for l in sell_levels)
 
     if total_bid is None:
@@ -193,8 +197,15 @@ def _extract_session(client, login_resp=None, validate_resp=None):
     targets = {
         "session_token": ["session_token", "sessionToken", "token"],
         "sid": ["sid", "SID"],
-        "server_id": ["server_id", "serverId", "serverid"],
+        "server_id": ["server_id", "serverId", "serverid", "hsServerId"],
         "access_token": ["access_token", "accessToken", "bearer_token"],
+        # base_url is the actual missing piece behind the '+=': NoneType and
+        # str' crash - this SDK's quotes() builds its request domain from
+        # configuration.base_url, which totp_validate()'s response sets from
+        # data.baseUrl, and which is otherwise None on a fresh client. It has
+        # to be captured at login and reapplied manually on every later
+        # client instance (see _handle_quotes).
+        "base_url": ["base_url", "baseUrl"],
     }
     session = {}
     for out_key, names in targets.items():
@@ -282,6 +293,17 @@ def _handle_quotes(form):
             access_token=reinit_token,
             neo_fin_key=None,
         )
+        # The real bug (confirmed by reading the installed SDK's source):
+        # quotes() builds its request domain from configuration.base_url,
+        # which this SDK ONLY ever sets inside totp_validate() itself, from
+        # the login response's data.baseUrl. A freshly-constructed client
+        # (as every serverless invocation necessarily creates) never runs
+        # that method, so base_url stays None and the SDK's internal
+        # `domain_info += ...` crashes on it - regardless of what we pass
+        # into quotes(). Since we captured base_url from the original login
+        # response, reapply it here manually before calling quotes().
+        if session.get("base_url"):
+            client.configuration.base_url = session["base_url"]
         # Different neo_api_client releases accept different keyword arguments
         # here (e.g. some don't have isIndex at all). Rather than guess and
         # break on every SDK bump, only pass the kwargs this installed
@@ -291,7 +313,11 @@ def _handle_quotes(form):
         # treating a missing value gracefully.
         candidate_kwargs = {
             "instrument_tokens": payload,
-            "quote_type": "market_depth",
+            # "market_depth" is not a documented quote_type for this SDK
+            # (valid values: all, depth, ohlc, ltp, oi, 52w, circuit_limits,
+            # scrip_details). "" defaults internally to "all", which still
+            # includes the depth object we need.
+            "quote_type": "",
             "isIndex": False,
             "is_index": False,
             "session_token": session.get("session_token"),
@@ -319,13 +345,20 @@ def _handle_quotes(form):
             },
         }
 
-    rows_raw = response.get("message", response) if isinstance(response, dict) else response
+    # Confirmed against the reference app's working parsing: the SDK returns
+    # rows under response["data"] (a plain list fallback if the response
+    # isn't a dict), and each row identifies its instrument via
+    # "exchange_token" (not "instrument_token"/"tk"/"token").
+    if isinstance(response, dict):
+        rows_raw = response.get("data", response.get("message", []))
+    else:
+        rows_raw = response
     if not isinstance(rows_raw, list):
         rows_raw = [rows_raw]
 
     by_token = {}
     for q in rows_raw:
-        tok = str(q.get("instrument_token") or q.get("tk") or q.get("token") or "")
+        tok = str(q.get("exchange_token") or q.get("instrument_token") or q.get("tk") or q.get("token") or "")
         by_token[tok] = q
 
     cards = []
@@ -334,7 +367,7 @@ def _handle_quotes(form):
         total_bid, total_ask, ltp = _extract_totals(q)
         cards.append({
             "token": inst["token"],
-            "symbol": inst.get("symbol", inst["token"]),
+            "symbol": q.get("display_symbol") or inst.get("symbol", inst["token"]),
             "ltp": ltp,
             "total_bid_qty": total_bid,
             "total_ask_qty": total_ask,

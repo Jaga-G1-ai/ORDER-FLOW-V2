@@ -55,12 +55,20 @@
   .qcard .top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;}
   .qcard .sym{font-weight:600;font-size:14px;}
   .qcard .ltp{font-family:'JetBrains Mono',monospace;font-size:15px;color:var(--accent);}
-  .bar{position:relative;height:8px;border-radius:5px;background:var(--panel2);overflow:hidden;margin-bottom:10px;}
-  .bar .bid-fill{position:absolute;left:0;top:0;bottom:0;background:var(--bid);}
-  .bar .ask-fill{position:absolute;right:0;top:0;bottom:0;background:var(--ask);}
+  .clv-track{position:relative;height:8px;border-radius:5px;margin-bottom:6px;
+    background:linear-gradient(90deg, #D33A4B 0%, #D33A4B 15%, #F7A6B8 50%, #3DDC97 50%, #FFD93D 75%, #FFB300 100%);}
+  .clv-marker{position:absolute;top:-3px;width:3px;height:14px;border-radius:2px;background:#fff;
+    box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 6px rgba(255,255,255,.6);transform:translateX(-1.5px);}
+  .clv-label{display:flex;justify-content:space-between;align-items:center;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--fg2);margin-bottom:10px;}
+  .clv-label .clv-value{font-weight:600;}
   .totals{display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:13px;}
   .totals .b{color:var(--bid);} .totals .a{color:var(--ask);}
+  .totals .pct{color:var(--fg2);font-size:11px;}
   .qcard .tok{color:var(--fg2);font-size:10.5px;font-family:'JetBrains Mono',monospace;margin-top:8px;}
+  .sort-row{display:flex;align-items:center;gap:10px;margin-bottom:12px;}
+  .sort-btn{background:var(--panel2);border:1px solid var(--border);color:var(--fg2);border-radius:8px;
+    padding:7px 13px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer;}
+  .sort-btn.active{background:var(--accent);color:#fff;border-color:var(--accent);}
 
   /* ---- history ---- */
   #history-panel{margin-top:10px;}
@@ -121,6 +129,9 @@
 
     <div class="section">
       <div class="section-title">Live totals</div>
+      <div class="sort-row">
+        <button class="sort-btn" id="sort-clv-btn">Sort by Close Location</button>
+      </div>
       <div id="cards"></div>
     </div>
 
@@ -132,7 +143,7 @@
         <span class="badge" id="history-count">0 snapshots saved</span>
       </div>
       <table id="history-table">
-        <thead><tr><th>Time</th><th>Symbol</th><th>LTP</th><th>Total Bid Qty</th><th>Total Ask Qty</th></tr></thead>
+        <thead><tr><th>Time</th><th>Symbol</th><th>LTP</th><th>Close Loc.</th><th>Total Bid Qty</th><th>Total Ask Qty</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -149,6 +160,8 @@ const MAX_HISTORY_ROWS = 3000;
 let session = null;         // {consumer_key, session:{...}}
 let instruments = [];       // [{symbol, token, exchange_segment}]
 let pollTimer = null;
+let lastCards = [];         // most recent poll result, kept so sort toggling doesn't need a fresh fetch
+let clvSortActive = false;
 
 // ---------- storage helpers (browser localStorage = "later viewing") ----------
 function loadJSON(key, fallback){
@@ -280,6 +293,31 @@ function renderInstrumentCount(){
 
 // ---------- polling + cards ----------
 function fmt(n){ return (n===null||n===undefined||isNaN(n)) ? '—' : Number(n).toLocaleString(); }
+function fmtPct(n){ return (n===null||n===undefined||isNaN(n)) ? '' : ` (${n}%)`; }
+
+// Diverging gradient centered at 0.5:
+//   0.5 -> 1.0 : green -> yellow -> gold   (0.75 = yellow, 0.85+ deep into gold)
+//   0.0 -> 0.5 : red -> pink                (0.15 = fully red, plateaus below that)
+function lerpColor(v, stops){
+  if(v<=stops[0][0]) return stops[0][1];
+  if(v>=stops[stops.length-1][0]) return stops[stops.length-1][1];
+  for(let i=0;i<stops.length-1;i++){
+    const [v0,c0]=stops[i], [v1,c1]=stops[i+1];
+    if(v>=v0 && v<=v1){
+      const t = v1>v0 ? (v-v0)/(v1-v0) : 0;
+      return c0.map((ch,idx)=>Math.round(ch+(c1[idx]-ch)*t));
+    }
+  }
+  return stops[stops.length-1][1];
+}
+function clvColor(v){
+  if(v===null||v===undefined||isNaN(v)) return 'rgb(124,135,152)'; // neutral fg2 grey - no OHLC data
+  v = Math.max(0, Math.min(1, v));
+  const rgb = v>=0.5
+    ? lerpColor(v, [[0.50,[61,220,151]], [0.75,[255,217,61]], [1.00,[255,179,0]]])   // green -> yellow -> gold
+    : lerpColor(v, [[0.15,[211,58,75]], [0.50,[247,166,184]]]);                        // red -> pink
+  return `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+}
 
 async function pollOnce(){
   if(!instruments.length){
@@ -297,9 +335,10 @@ async function pollOnce(){
       document.getElementById('poll-status').textContent = 'error: ' + data.error;
       return;
     }
-    renderCards(data.cards);
+    lastCards = data.cards;
+    renderCards(lastCards);
     const now = new Date().toLocaleTimeString();
-    saveHistory(data.cards.map(c => ({time: now, symbol: c.symbol, ltp: c.ltp, total_bid_qty: c.total_bid_qty, total_ask_qty: c.total_ask_qty})));
+    saveHistory(data.cards.map(c => ({time: now, symbol: c.symbol, ltp: c.ltp, total_bid_qty: c.total_bid_qty, total_ask_qty: c.total_ask_qty, clv: c.clv})));
     renderHistorySymbolOptions();
     renderHistoryTable();
     document.getElementById('poll-status').textContent = `updated ${now}`;
@@ -311,20 +350,36 @@ async function pollOnce(){
 function renderCards(cards){
   const wrap = document.getElementById('cards');
   wrap.innerHTML = '';
-  cards.forEach(c=>{
+  const list = clvSortActive
+    ? [...cards].sort((a,b) => (b.clv ?? -1) - (a.clv ?? -1))   // highest close-location first, missing values last
+    : cards;
+  list.forEach(c=>{
     const bid = c.total_bid_qty || 0, ask = c.total_ask_qty || 0;
-    const total = bid + ask;
-    const bidPct = total ? (bid/total*100) : 50;
+    const hasClv = c.clv !== null && c.clv !== undefined && !isNaN(c.clv);
+    const clvPct = hasClv ? c.clv * 100 : 50;
+    const color = clvColor(c.clv);
     const div = document.createElement('div');
     div.className = 'qcard';
     div.innerHTML = `
       <div class="top"><span class="sym">${c.symbol}</span><span class="ltp mono">${fmt(c.ltp)}</span></div>
-      <div class="bar"><div class="bid-fill" style="width:${bidPct}%"></div><div class="ask-fill" style="width:${100-bidPct}%"></div></div>
-      <div class="totals"><span class="b">Bid ${fmt(bid)}</span><span class="a">Ask ${fmt(ask)}</span></div>
+      <div class="clv-track"><div class="clv-marker" style="left:${clvPct}%"></div></div>
+      <div class="clv-label"><span>Close Location</span><span class="clv-value mono" style="color:${color}">${hasClv ? c.clv.toFixed(2) : '—'}</span></div>
+      <div class="totals">
+        <span class="b">Bid ${fmt(bid)}<span class="pct">${fmtPct(c.total_bid_pct)}</span></span>
+        <span class="a">Ask ${fmt(ask)}<span class="pct">${fmtPct(c.total_ask_pct)}</span></span>
+      </div>
       <div class="tok">token ${c.token}</div>`;
     wrap.appendChild(div);
   });
 }
+
+document.getElementById('sort-clv-btn').addEventListener('click', ()=>{
+  clvSortActive = !clvSortActive;
+  const btn = document.getElementById('sort-clv-btn');
+  btn.classList.toggle('active', clvSortActive);
+  btn.textContent = clvSortActive ? 'Sorted by Close Location (highest first)' : 'Sort by Close Location';
+  renderCards(lastCards);
+});
 
 function startPolling(){
   pollOnce();
@@ -352,7 +407,7 @@ function renderHistoryTable(){
   const rows = (symbol ? hist.filter(h=>h.symbol===symbol) : hist).slice(-100).reverse();
   const tbody = document.querySelector('#history-table tbody');
   tbody.innerHTML = rows.map(r=>`
-    <tr><td>${r.time}</td><td>${r.symbol}</td><td>${fmt(r.ltp)}</td><td>${fmt(r.total_bid_qty)}</td><td>${fmt(r.total_ask_qty)}</td></tr>
+    <tr><td>${r.time}</td><td>${r.symbol}</td><td>${fmt(r.ltp)}</td><td>${r.clv!==null&&r.clv!==undefined?r.clv.toFixed(2):'—'}</td><td>${fmt(r.total_bid_qty)}</td><td>${fmt(r.total_ask_qty)}</td></tr>
   `).join('');
 }
 
@@ -360,8 +415,8 @@ function exportHistoryCSV(){
   const hist = loadHistory();
   const symbol = document.getElementById('history-symbol').value;
   const rows = symbol ? hist.filter(h=>h.symbol===symbol) : hist;
-  const header = 'time,symbol,ltp,total_bid_qty,total_ask_qty\n';
-  const body = rows.map(r=>`${r.time},${r.symbol},${r.ltp ?? ''},${r.total_bid_qty ?? ''},${r.total_ask_qty ?? ''}`).join('\n');
+  const header = 'time,symbol,ltp,clv,total_bid_qty,total_ask_qty\n';
+  const body = rows.map(r=>`${r.time},${r.symbol},${r.ltp ?? ''},${r.clv ?? ''},${r.total_bid_qty ?? ''},${r.total_ask_qty ?? ''}`).join('\n');
   const blob = new Blob([header+body], {type:'text/csv'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);

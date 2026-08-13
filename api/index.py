@@ -273,7 +273,10 @@ def _handle_quotes(form):
         # Different neo_api_client releases accept different keyword arguments
         # here (e.g. some don't have isIndex at all). Rather than guess and
         # break on every SDK bump, only pass the kwargs this installed
-        # version's quotes() actually declares.
+        # version's quotes() actually declares - and never pass a None value,
+        # since the SDK's internals may do plain string concatenation on
+        # sid/server_id/session_token and blow up on None rather than
+        # treating a missing value gracefully.
         candidate_kwargs = {
             "instrument_tokens": payload,
             "quote_type": "market_depth",
@@ -283,6 +286,7 @@ def _handle_quotes(form):
             "sid": session.get("sid"),
             "server_id": session.get("server_id"),
         }
+        candidate_kwargs = {k: v for k, v in candidate_kwargs.items() if v is not None}
         response = client.quotes(**_supported_kwargs(client.quotes, candidate_kwargs))
     except Exception as exc:
         try:
@@ -292,7 +296,11 @@ def _handle_quotes(form):
         return 200, {
             "ok": False,
             "error": f"Quote fetch failed: {exc}",
-            "debug": {"quotes_accepted_params": accepted},
+            "debug": {
+                "quotes_accepted_params": accepted,
+                "session_received": {k: _mask(v) for k, v in session.items()},
+                "kwargs_sent": {k: _mask(v) for k, v in candidate_kwargs.items() if k != "instrument_tokens"},
+            },
         }
 
     rows_raw = response.get("message", response) if isinstance(response, dict) else response

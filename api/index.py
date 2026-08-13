@@ -128,6 +128,47 @@ def _extract_totals(quote):
     return total_bid, total_ask, ltp
 
 
+def _extract_ohlc(quote):
+    """
+    Pull day high/low out of a quote payload. Confirmed primary shape (from
+    the reference app): a nested "ohlc": {"open","high","low","close"} dict.
+    Flat fallbacks are checked too since this has moved around before.
+    """
+    high, low = None, None
+    ohlc = quote.get("ohlc")
+    if isinstance(ohlc, dict):
+        if "high" in ohlc:
+            high = _to_num(ohlc["high"])
+        if "low" in ohlc:
+            low = _to_num(ohlc["low"])
+
+    if high is None:
+        for k in ("high", "day_high", "highPrice", "high_price", "h"):
+            if k in quote:
+                high = _to_num(quote[k])
+                break
+    if low is None:
+        for k in ("low", "day_low", "lowPrice", "low_price", "l"):
+            if k in quote:
+                low = _to_num(quote[k])
+                break
+
+    return high, low
+
+
+def _compute_clv(ltp, high, low):
+    """
+    Close Location Value: where the current price sits within today's
+    high/low range, scaled 0-1. Uses the live LTP as the "close" reference
+    intraday. Clamped to [0, 1] since a stale/premarket LTP can briefly sit
+    outside the day's recorded range.
+    """
+    if ltp is None or high is None or low is None or high == low:
+        return None
+    clv = (ltp - low) / (high - low)
+    return max(0.0, min(1.0, clv))
+
+
 def _mask(v):
     """Keep enough of a value to identify what it is, without leaking a full token."""
     if isinstance(v, str):
@@ -365,12 +406,24 @@ def _handle_quotes(form):
     for inst in instruments:
         q = by_token.get(str(inst["token"]), {})
         total_bid, total_ask, ltp = _extract_totals(q)
+        high, low = _extract_ohlc(q)
+        clv = _compute_clv(ltp, high, low)
+
+        qty_total = (total_bid or 0) + (total_ask or 0)
+        bid_pct = round((total_bid or 0) / qty_total * 100, 1) if qty_total else None
+        ask_pct = round((total_ask or 0) / qty_total * 100, 1) if qty_total else None
+
         cards.append({
             "token": inst["token"],
             "symbol": q.get("display_symbol") or inst.get("symbol", inst["token"]),
             "ltp": ltp,
             "total_bid_qty": total_bid,
             "total_ask_qty": total_ask,
+            "total_bid_pct": bid_pct,
+            "total_ask_pct": ask_pct,
+            "day_high": high,
+            "day_low": low,
+            "clv": clv,
         })
 
     return 200, {"ok": True, "cards": cards}

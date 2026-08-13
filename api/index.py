@@ -14,6 +14,7 @@ Frontend calls:
     POST /api/index  {"action": "quotes", ...}
 """
 
+import inspect
 import json
 import os
 from http.server import BaseHTTPRequestHandler
@@ -56,6 +57,24 @@ def _to_num(v):
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _supported_kwargs(func, candidate_kwargs):
+    """
+    Filter a dict of candidate keyword arguments down to only the ones
+    `func`'s signature actually declares (or pass everything through if the
+    function accepts **kwargs). Keeps SDK-version drift (e.g. one release
+    having `isIndex`, another not) from breaking the call outright.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return candidate_kwargs  # can't introspect (e.g. C extension) - pass as-is
+
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return candidate_kwargs
+
+    return {k: v for k, v in candidate_kwargs.items() if k in params}
 
 
 def _extract_totals(quote):
@@ -251,16 +270,30 @@ def _handle_quotes(form):
             access_token=None,
             neo_fin_key=None,
         )
-        response = client.quotes(
-            instrument_tokens=payload,
-            quote_type="market_depth",
-            isIndex=False,
-            session_token=session.get("session_token"),
-            sid=session.get("sid"),
-            server_id=session.get("server_id"),
-        )
+        # Different neo_api_client releases accept different keyword arguments
+        # here (e.g. some don't have isIndex at all). Rather than guess and
+        # break on every SDK bump, only pass the kwargs this installed
+        # version's quotes() actually declares.
+        candidate_kwargs = {
+            "instrument_tokens": payload,
+            "quote_type": "market_depth",
+            "isIndex": False,
+            "is_index": False,
+            "session_token": session.get("session_token"),
+            "sid": session.get("sid"),
+            "server_id": session.get("server_id"),
+        }
+        response = client.quotes(**_supported_kwargs(client.quotes, candidate_kwargs))
     except Exception as exc:
-        return 200, {"ok": False, "error": f"Quote fetch failed: {exc}"}
+        try:
+            accepted = list(inspect.signature(client.quotes).parameters.keys())
+        except Exception:
+            accepted = None
+        return 200, {
+            "ok": False,
+            "error": f"Quote fetch failed: {exc}",
+            "debug": {"quotes_accepted_params": accepted},
+        }
 
     rows_raw = response.get("message", response) if isinstance(response, dict) else response
     if not isinstance(rows_raw, list):

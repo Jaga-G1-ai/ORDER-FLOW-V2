@@ -1,0 +1,4 @@
+# If neo-api-client isn't resolvable from PyPI for your account/region,
+# swap the line below for the GitHub source instead:
+# git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@main#egg=neo_api_client
+neo-api-client

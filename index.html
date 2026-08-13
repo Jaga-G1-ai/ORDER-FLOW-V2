@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Order Book Watch — Kotak Neo</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0D1117; --panel:#151B23; --panel2:#1C2430; --border:#2A3341;
+    --fg:#EAEEF3; --fg2:#7C8798; --accent:#5B8DEF; --bid:#3DDC97; --ask:#FF6B6B;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:'Sora',sans-serif;min-height:100vh;}
+  .mono{font-family:'JetBrains Mono',monospace;}
+  .hidden{display:none !important;}
+
+  /* ---- shell ---- */
+  header{display:flex;justify-content:space-between;align-items:center;padding:18px 28px;border-bottom:1px solid var(--border);}
+  header .brand{display:flex;align-items:center;gap:10px;}
+  header .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.02em;}
+  header .status{font-size:11.5px;color:var(--fg2);font-family:'JetBrains Mono',monospace;}
+  main{max-width:1180px;margin:0 auto;padding:28px 20px 70px;}
+
+  /* ---- login card ---- */
+  #login-wrap{display:flex;min-height:78vh;align-items:center;justify-content:center;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:30px;}
+  #login-wrap .card{width:100%;max-width:400px;}
+  .card h2{margin:0 0 4px;font-size:17px;}
+  .card .hint{color:var(--fg2);font-size:12.5px;margin-bottom:20px;line-height:1.5;}
+  .field{margin-bottom:13px;}
+  .field label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--fg2);margin-bottom:6px;}
+  .field input{width:100%;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--fg);font-family:'JetBrains Mono',monospace;font-size:13px;}
+  .field input:focus{outline:none;border-color:var(--accent);}
+  .btn{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:11px 18px;font-weight:600;font-size:13.5px;cursor:pointer;font-family:'Sora',sans-serif;}
+  .btn:disabled{opacity:.55;cursor:not-allowed;}
+  .btn.secondary{background:var(--panel2);color:var(--fg);border:1px solid var(--border);}
+  .btn.ghost{background:none;border:1px solid var(--border);color:var(--fg2);}
+  .alert{background:rgba(255,107,107,.1);border:1px solid rgba(255,107,107,.35);color:var(--ask);font-size:12.5px;padding:9px 12px;border-radius:8px;margin-bottom:12px;font-family:'JetBrains Mono',monospace;}
+
+  /* ---- instrument setup ---- */
+  .section{margin-bottom:26px;}
+  .section-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg2);margin-bottom:10px;font-weight:600;}
+  #upload-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--panel);border:1px dashed var(--border);border-radius:12px;padding:18px;}
+  #upload-row input[type=file]{color:var(--fg2);font-size:12.5px;}
+  #upload-msg{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--fg2);}
+  #manual-add{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;}
+  #manual-add input{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:9px 11px;color:var(--fg);font-family:'JetBrains Mono',monospace;font-size:12.5px;}
+
+  /* ---- cards grid ---- */
+  #cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px;}
+  .qcard{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;}
+  .qcard .top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;}
+  .qcard .sym{font-weight:600;font-size:14px;}
+  .qcard .ltp{font-family:'JetBrains Mono',monospace;font-size:15px;color:var(--accent);}
+  .bar{position:relative;height:8px;border-radius:5px;background:var(--panel2);overflow:hidden;margin-bottom:10px;}
+  .bar .bid-fill{position:absolute;left:0;top:0;bottom:0;background:var(--bid);}
+  .bar .ask-fill{position:absolute;right:0;top:0;bottom:0;background:var(--ask);}
+  .totals{display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:13px;}
+  .totals .b{color:var(--bid);} .totals .a{color:var(--ask);}
+  .qcard .tok{color:var(--fg2);font-size:10.5px;font-family:'JetBrains Mono',monospace;margin-top:8px;}
+
+  /* ---- history ---- */
+  #history-panel{margin-top:10px;}
+  table{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:12px;}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);}
+  th{color:var(--fg2);font-weight:500;text-transform:uppercase;font-size:10px;letter-spacing:.06em;}
+  select{background:var(--panel2);border:1px solid var(--border);color:var(--fg);border-radius:7px;padding:7px 10px;font-family:'JetBrains Mono',monospace;font-size:12.5px;}
+  .row-tools{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap;}
+  .badge{background:var(--panel2);border:1px solid var(--border);color:var(--fg2);font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 9px;border-radius:20px;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand"><span class="dot"></span><h1>ORDER BOOK WATCH</h1></div>
+  <div>
+    <span class="status mono" id="poll-status">not connected</span>
+    <button class="btn ghost hidden" id="logout-btn" style="margin-left:14px;">disconnect</button>
+  </div>
+</header>
+
+<main>
+  <!-- LOGIN -->
+  <div id="login-wrap">
+    <div class="card">
+      <h2>Connect to Kotak Neo</h2>
+      <div class="hint">TOTP-based login — current neo_api_client builds only need a consumer key, no consumer secret. Nothing is stored on any server; your session lives only in this browser tab.</div>
+      <div id="login-alert" class="alert hidden"></div>
+      <div class="field"><label>Consumer Key</label><input id="in-key" placeholder="from Invest → Trade API"></div>
+      <div class="field"><label>Mobile Number</label><input id="in-mobile" placeholder="+91XXXXXXXXXX"></div>
+      <div class="field"><label>UCC</label><input id="in-ucc"></div>
+      <div class="field"><label>TOTP</label><input id="in-totp" maxlength="6"></div>
+      <div class="field"><label>MPIN</label><input id="in-mpin" type="password"></div>
+      <button class="btn" id="login-btn" style="width:100%;">Connect</button>
+    </div>
+  </div>
+
+  <!-- DASHBOARD -->
+  <div id="dash-wrap" class="hidden">
+    <div class="section">
+      <div class="section-title">Instrument list</div>
+      <div id="upload-row">
+        <div>
+          <div style="font-size:13px;margin-bottom:4px;">Upload your token file (.xlsx with SYMBOL / TOKEN columns)</div>
+          <input type="file" id="file-input" accept=".xlsx,.xls,.csv">
+        </div>
+        <span id="upload-msg" class="mono"></span>
+      </div>
+      <div id="manual-add">
+        <input id="add-symbol" placeholder="SYMBOL">
+        <input id="add-token" placeholder="TOKEN">
+        <input id="add-segment" placeholder="nse_cm" value="nse_cm">
+        <button class="btn secondary" id="add-btn">+ Add</button>
+        <button class="btn ghost" id="clear-btn">Clear list</button>
+        <span class="badge" id="count-badge">0 instruments</span>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Live totals</div>
+      <div id="cards"></div>
+    </div>
+
+    <div class="section" id="history-panel">
+      <div class="section-title">Stored history (this browser)</div>
+      <div class="row-tools">
+        <select id="history-symbol"><option value="">— select symbol —</option></select>
+        <button class="btn secondary" id="export-btn">Export CSV</button>
+        <span class="badge" id="history-count">0 snapshots saved</span>
+      </div>
+      <table id="history-table">
+        <thead><tr><th>Time</th><th>Symbol</th><th>LTP</th><th>Total Bid Qty</th><th>Total Ask Qty</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script>
+const POLL_MS = 5000;
+const LS_SESSION = "obw_session";
+const LS_INSTRUMENTS = "obw_instruments";
+const LS_HISTORY = "obw_history";
+const MAX_HISTORY_ROWS = 3000;
+
+let session = null;         // {consumer_key, session:{...}}
+let instruments = [];       // [{symbol, token, exchange_segment}]
+let pollTimer = null;
+
+// ---------- storage helpers (browser localStorage = "later viewing") ----------
+function loadJSON(key, fallback){
+  try{ return JSON.parse(sessionStorage.getItem(key) || localStorage.getItem(key)) ?? fallback; }
+  catch(e){ return fallback; }
+}
+function saveInstruments(){ localStorage.setItem(LS_INSTRUMENTS, JSON.stringify(instruments)); }
+function loadInstruments(){ instruments = loadJSON(LS_INSTRUMENTS, []); }
+function saveHistory(rows){
+  const hist = loadJSON(LS_HISTORY, []);
+  hist.push(...rows);
+  const trimmed = hist.slice(-MAX_HISTORY_ROWS);
+  localStorage.setItem(LS_HISTORY, JSON.stringify(trimmed));
+}
+function loadHistory(){ return loadJSON(LS_HISTORY, []); }
+
+// ---------- login ----------
+document.getElementById('login-btn').addEventListener('click', doLogin);
+async function doLogin(){
+  const btn = document.getElementById('login-btn');
+  const alertBox = document.getElementById('login-alert');
+  alertBox.classList.add('hidden');
+  btn.disabled = true; btn.textContent = 'Connecting…';
+
+  const body = {
+    consumer_key: document.getElementById('in-key').value.trim(),
+    mobile_number: document.getElementById('in-mobile').value.trim(),
+    ucc: document.getElementById('in-ucc').value.trim(),
+    totp: document.getElementById('in-totp').value.trim(),
+    mpin: document.getElementById('in-mpin').value.trim(),
+  };
+
+  try{
+    const res = await fetch('/api/index', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'login', ...body})});
+    const data = await res.json();
+    if(!data.ok){
+      alertBox.textContent = data.error || 'Login failed.';
+      alertBox.classList.remove('hidden');
+      return;
+    }
+    session = {consumer_key: data.consumer_key, session: data.session};
+    // sessionStorage only - cleared when the tab closes, kept off localStorage
+    // so it never lingers on a shared machine.
+    sessionStorage.setItem(LS_SESSION, JSON.stringify(session));
+    enterDashboard();
+  } catch(e){
+    alertBox.textContent = 'Request failed: ' + e.message;
+    alertBox.classList.remove('hidden');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Connect';
+  }
+}
+
+document.getElementById('logout-btn').addEventListener('click', ()=>{
+  stopPolling();
+  sessionStorage.removeItem(LS_SESSION);
+  session = null;
+  document.getElementById('dash-wrap').classList.add('hidden');
+  document.getElementById('login-wrap').classList.remove('hidden');
+  document.getElementById('logout-btn').classList.add('hidden');
+  document.getElementById('poll-status').textContent = 'not connected';
+});
+
+function enterDashboard(){
+  document.getElementById('login-wrap').classList.add('hidden');
+  document.getElementById('dash-wrap').classList.remove('hidden');
+  document.getElementById('logout-btn').classList.remove('hidden');
+  loadInstruments();
+  renderInstrumentCount();
+  renderHistorySymbolOptions();
+  renderHistoryTable();
+  startPolling();
+}
+
+// ---------- instrument list: xlsx upload ----------
+document.getElementById('file-input').addEventListener('change', handleFile);
+function handleFile(e){
+  const file = e.target.files[0];
+  const msg = document.getElementById('upload-msg');
+  if(!file) return;
+  msg.textContent = 'reading...';
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    try{
+      const wb = XLSX.read(ev.target.result, {type:'binary'});
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, {defval:''});
+      let added = 0;
+      rows.forEach(r=>{
+        const symbol = String(r.SYMBOL ?? r.Symbol ?? r.symbol ?? '').trim();
+        const token = String(r.TOKEN ?? r.Token ?? r.token ?? '').trim();
+        if(!symbol || !token) return;
+        if(instruments.some(i=>i.token === token)) return;
+        instruments.push({symbol, token, exchange_segment: 'nse_cm'});
+        added++;
+      });
+      saveInstruments();
+      renderInstrumentCount();
+      msg.textContent = `added ${added} instruments`;
+    }catch(err){
+      msg.textContent = 'could not parse file: ' + err.message;
+    }
+  };
+  reader.readAsBinaryString(file);
+}
+
+// ---------- instrument list: manual add ----------
+document.getElementById('add-btn').addEventListener('click', ()=>{
+  const symbol = document.getElementById('add-symbol').value.trim();
+  const token = document.getElementById('add-token').value.trim();
+  const segment = document.getElementById('add-segment').value.trim() || 'nse_cm';
+  if(!symbol || !token) return;
+  if(instruments.some(i=>i.token === token)) return;
+  instruments.push({symbol, token, exchange_segment: segment});
+  saveInstruments();
+  renderInstrumentCount();
+  document.getElementById('add-symbol').value = '';
+  document.getElementById('add-token').value = '';
+});
+document.getElementById('clear-btn').addEventListener('click', ()=>{
+  instruments = [];
+  saveInstruments();
+  renderInstrumentCount();
+  document.getElementById('cards').innerHTML = '';
+});
+function renderInstrumentCount(){
+  document.getElementById('count-badge').textContent = `${instruments.length} instruments`;
+}
+
+// ---------- polling + cards ----------
+function fmt(n){ return (n===null||n===undefined||isNaN(n)) ? '—' : Number(n).toLocaleString(); }
+
+async function pollOnce(){
+  if(!instruments.length){
+    document.getElementById('poll-status').textContent = 'no instruments loaded';
+    return;
+  }
+  document.getElementById('poll-status').textContent = 'fetching…';
+  try{
+    const res = await fetch('/api/index', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'quotes', consumer_key: session.consumer_key, session: session.session, instruments})
+    });
+    const data = await res.json();
+    if(!data.ok){
+      document.getElementById('poll-status').textContent = 'error: ' + data.error;
+      return;
+    }
+    renderCards(data.cards);
+    const now = new Date().toLocaleTimeString();
+    saveHistory(data.cards.map(c => ({time: now, symbol: c.symbol, ltp: c.ltp, total_bid_qty: c.total_bid_qty, total_ask_qty: c.total_ask_qty})));
+    renderHistorySymbolOptions();
+    renderHistoryTable();
+    document.getElementById('poll-status').textContent = `updated ${now}`;
+  }catch(e){
+    document.getElementById('poll-status').textContent = 'request failed';
+  }
+}
+
+function renderCards(cards){
+  const wrap = document.getElementById('cards');
+  wrap.innerHTML = '';
+  cards.forEach(c=>{
+    const bid = c.total_bid_qty || 0, ask = c.total_ask_qty || 0;
+    const total = bid + ask;
+    const bidPct = total ? (bid/total*100) : 50;
+    const div = document.createElement('div');
+    div.className = 'qcard';
+    div.innerHTML = `
+      <div class="top"><span class="sym">${c.symbol}</span><span class="ltp mono">${fmt(c.ltp)}</span></div>
+      <div class="bar"><div class="bid-fill" style="width:${bidPct}%"></div><div class="ask-fill" style="width:${100-bidPct}%"></div></div>
+      <div class="totals"><span class="b">Bid ${fmt(bid)}</span><span class="a">Ask ${fmt(ask)}</span></div>
+      <div class="tok">token ${c.token}</div>`;
+    wrap.appendChild(div);
+  });
+}
+
+function startPolling(){
+  pollOnce();
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollOnce, POLL_MS);
+}
+function stopPolling(){ if(pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
+
+// ---------- history view ----------
+document.getElementById('history-symbol').addEventListener('change', renderHistoryTable);
+document.getElementById('export-btn').addEventListener('click', exportHistoryCSV);
+
+function renderHistorySymbolOptions(){
+  const sel = document.getElementById('history-symbol');
+  const current = sel.value;
+  const symbols = [...new Set(loadHistory().map(h=>h.symbol))].sort();
+  sel.innerHTML = '<option value="">— select symbol —</option>' + symbols.map(s=>`<option value="${s}">${s}</option>`).join('');
+  sel.value = symbols.includes(current) ? current : '';
+}
+
+function renderHistoryTable(){
+  const hist = loadHistory();
+  document.getElementById('history-count').textContent = `${hist.length} snapshots saved`;
+  const symbol = document.getElementById('history-symbol').value;
+  const rows = (symbol ? hist.filter(h=>h.symbol===symbol) : hist).slice(-100).reverse();
+  const tbody = document.querySelector('#history-table tbody');
+  tbody.innerHTML = rows.map(r=>`
+    <tr><td>${r.time}</td><td>${r.symbol}</td><td>${fmt(r.ltp)}</td><td>${fmt(r.total_bid_qty)}</td><td>${fmt(r.total_ask_qty)}</td></tr>
+  `).join('');
+}
+
+function exportHistoryCSV(){
+  const hist = loadHistory();
+  const symbol = document.getElementById('history-symbol').value;
+  const rows = symbol ? hist.filter(h=>h.symbol===symbol) : hist;
+  const header = 'time,symbol,ltp,total_bid_qty,total_ask_qty\n';
+  const body = rows.map(r=>`${r.time},${r.symbol},${r.ltp ?? ''},${r.total_bid_qty ?? ''},${r.total_ask_qty ?? ''}`).join('\n');
+  const blob = new Blob([header+body], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `order_book_history${symbol ? '_'+symbol : ''}.csv`;
+  a.click();
+}
+
+// ---------- resume session on reload ----------
+(function init(){
+  const saved = sessionStorage.getItem(LS_SESSION);
+  if(saved){
+    session = JSON.parse(saved);
+    enterDashboard();
+  }
+})();
+</script>
+</body>
+</html>

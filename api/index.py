@@ -104,33 +104,85 @@ def _extract_totals(quote):
     return total_bid, total_ask, ltp
 
 
-def _extract_session(client):
+def _mask(v):
+    """Keep enough of a value to identify what it is, without leaking a full token."""
+    if isinstance(v, str):
+        return v if len(v) <= 8 else f"{v[:4]}...{v[-4:]} (len={len(v)})"
+    if isinstance(v, (int, float, bool)) or v is None:
+        return v
+    if isinstance(v, dict):
+        return {k: _mask(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_mask(x) for x in v[:5]]
+    return f"<{type(v).__name__}>"
+
+
+def _dump_obj(obj):
+    """Shallow, masked dump of an object's or dict's public attributes/keys."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {k: _mask(v) for k, v in obj.items()}
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        try:
+            return {k: _mask(v) for k, v in obj.to_dict().items()}
+        except Exception:
+            pass
+    if hasattr(obj, "__dict__"):
+        return {k: _mask(v) for k, v in vars(obj).items() if not k.startswith("_") and not callable(v)}
+    return f"<{type(obj).__name__}, no __dict__>"
+
+
+def _find_session_value(obj, names, seen=None):
+    """Recursively search a dict/object tree for the first key matching any of `names`."""
+    if seen is None:
+        seen = set()
+    if id(obj) in seen or obj is None:
+        return None
+    seen.add(id(obj))
+
+    if isinstance(obj, dict):
+        items = obj.items()
+    elif hasattr(obj, "__dict__"):
+        items = vars(obj).items()
+    else:
+        return None
+
+    lowered_names = {n.lower().replace("_", "") for n in names}
+    for k, v in items:
+        if isinstance(k, str) and k.lower().replace("_", "") in lowered_names and v:
+            return v
+    for k, v in items:
+        if isinstance(v, (dict,)) or (hasattr(v, "__dict__") and not callable(v)):
+            found = _find_session_value(v, names, seen)
+            if found:
+                return found
+    return None
+
+
+def _extract_session(client, login_resp=None, validate_resp=None):
     """
-    Newer neo_api_client releases don't need a consumer secret; after
-    totp_login()+totp_validate() succeed, the session details (session_token /
-    sid / server_id) live as attributes on the client (or its internal
-    configuration object). Exact attribute names have moved between SDK
-    releases, so a few known spots are probed defensively.
+    Newer neo_api_client releases don't need a consumer secret; the session
+    details (session_token / sid / server_id) may show up either in the
+    dict returned by totp_login()/totp_validate(), or as attributes on the
+    client object (or its internal configuration object). Exact field/attr
+    names have moved between SDK releases, so every known spot is searched.
     """
-    candidates = [client, getattr(client, "configuration", None), getattr(client, "api_client", None)]
-    keys = {
-        "session_token": ["session_token", "sessionToken"],
+    sources = [validate_resp, login_resp, client, getattr(client, "configuration", None),
+               getattr(client, "api_client", None)]
+    targets = {
+        "session_token": ["session_token", "sessionToken", "token"],
         "sid": ["sid", "SID"],
-        "server_id": ["server_id", "serverId"],
+        "server_id": ["server_id", "serverId", "serverid"],
         "access_token": ["access_token", "accessToken", "bearer_token"],
     }
     session = {}
-    for obj in candidates:
-        if obj is None:
-            continue
-        for out_key, attr_names in keys.items():
-            if out_key in session:
-                continue
-            for attr in attr_names:
-                if hasattr(obj, attr):
-                    val = getattr(obj, attr)
-                    if val:
-                        session[out_key] = val
+    for out_key, names in targets.items():
+        for src in sources:
+            val = _find_session_value(src, names)
+            if val:
+                session[out_key] = val
+                break
     return session
 
 
@@ -155,18 +207,25 @@ def _handle_login(form):
             access_token=None,
             neo_fin_key=None,
         )
-        client.totp_login(mobile_number=mobile_number, ucc=ucc, totp=totp)
-        client.totp_validate(mpin=mpin)
+        login_resp = client.totp_login(mobile_number=mobile_number, ucc=ucc, totp=totp)
+        validate_resp = client.totp_validate(mpin=mpin)
     except Exception as exc:
         return 200, {"ok": False, "error": f"Login failed: {exc}"}
 
-    session = _extract_session(client)
+    session = _extract_session(client, login_resp=login_resp, validate_resp=validate_resp)
     if not session.get("session_token"):
         return 200, {
             "ok": False,
-            "error": "Logged in but couldn't read session_token/sid/server_id off the "
-                     "client object. Check the SDK version's attribute names and update "
-                     "_extract_session() in api/index.py.",
+            "error": "Logged in but couldn't find session_token/sid/server_id anywhere in the "
+                     "login response. See `debug` below for the actual shape returned by your "
+                     "SDK version - share it and _extract_session()/_find_session_value() in "
+                     "api/index.py can be pointed at the right field names.",
+            "debug": {
+                "login_resp": _dump_obj(login_resp),
+                "validate_resp": _dump_obj(validate_resp),
+                "client": _dump_obj(client),
+                "client_configuration": _dump_obj(getattr(client, "configuration", None)),
+            },
         }
 
     return 200, {"ok": True, "consumer_key": consumer_key, "session": session}
@@ -237,7 +296,12 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        _send_json(self, 200, {"ok": True, "message": "POST {action: 'login'|'quotes', ...} to this endpoint."})
+        _send_json(self, 200, {
+            "ok": True,
+            "message": "This is the API function, not the app. Open the site root ('/') for the "
+                       "dashboard - it's served from public/index.html. POST here with "
+                       "{action: 'login'|'quotes', ...} to use the API directly.",
+        })
 
     def do_POST(self):
         form = _read_json_body(self)

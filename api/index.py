@@ -17,6 +17,7 @@ Frontend calls:
 import inspect
 import json
 import os
+import traceback
 from http.server import BaseHTTPRequestHandler
 
 from neo_api_client import NeoAPI
@@ -229,7 +230,7 @@ def _handle_login(form):
         login_resp = client.totp_login(mobile_number=mobile_number, ucc=ucc, totp=totp)
         validate_resp = client.totp_validate(mpin=mpin)
     except Exception as exc:
-        return 200, {"ok": False, "error": f"Login failed: {exc}"}
+        return 200, {"ok": False, "error": f"Login failed: {exc}", "debug": {"traceback": traceback.format_exc()[-4000:]}}
 
     session = _extract_session(client, login_resp=login_resp, validate_resp=validate_resp)
     if not session.get("session_token"):
@@ -314,6 +315,7 @@ def _handle_quotes(form):
                 "reinit_token_used": _mask(reinit_token) if reinit_token else None,
                 "session_received": {k: _mask(v) for k, v in session.items()},
                 "kwargs_sent": {k: _mask(v) for k, v in candidate_kwargs.items() if k != "instrument_tokens"},
+                "traceback": traceback.format_exc()[-4000:],
             },
         }
 

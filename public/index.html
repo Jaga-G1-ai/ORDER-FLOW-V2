@@ -132,6 +132,8 @@
       <div class="section-title">Live totals</div>
       <div class="sort-row">
         <button class="sort-btn" id="sort-clv-btn">Sort by Close Location</button>
+        <button class="sort-btn" id="sort-rsi-btn">Sort by RSI</button>
+        <button class="sort-btn" id="sort-tape-btn">Sort by Tape Speed</button>
         <button class="sort-btn filter-btn high" id="filter-high-btn">Close Loc. &gt; 0.8</button>
         <button class="sort-btn filter-btn low" id="filter-low-btn">Close Loc. &lt; 0.2</button>
         <span class="badge" id="filter-count-badge"></span>
@@ -159,13 +161,20 @@ const POLL_MS = 5000;
 const LS_SESSION = "obw_session";
 const LS_INSTRUMENTS = "obw_instruments";
 const LS_HISTORY = "obw_history";
-const MAX_HISTORY_ROWS = 3000;
+// Cap is GLOBAL (shared across every tracked symbol), so with a large
+// watchlist this fills up fast: at a 5s poll interval, N symbols write N
+// rows per poll, so surviving a 5-minute trailing window (needed for tape
+// speed below) needs roughly N * 60 rows of headroom. Raised from 3000 to
+// give reasonable watchlists (~100-200 symbols) a real trailing window
+// without blowing past typical localStorage quotas (~5-10MB) - each row is
+// roughly 250-300 bytes as JSON.
+const MAX_HISTORY_ROWS = 15000;
 
 let session = null;         // {consumer_key, session:{...}}
 let instruments = [];       // [{symbol, token, exchange_segment}]
 let pollTimer = null;
 let lastCards = [];         // most recent poll result, kept so sort toggling doesn't need a fresh fetch
-let clvSortActive = false;
+let sortMode = 'none'; // 'none' | 'clv' | 'rsi'
 let clvFilterHigh = false;  // show only CLV > 0.8
 let clvFilterLow = false;   // show only CLV < 0.2
 
@@ -325,6 +334,160 @@ function clvColor(v){
   return `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
 }
 
+// ---------- 5-minute / 14-period RSI, built entirely from our own polled LTPs ----------
+// The Kotak SDK we're using has no historical/candle endpoint at all (checked
+// its full method list), so there's no way to pull past 5-min candles from
+// Kotak directly. Instead we bucket our own 5s-interval poll history into
+// 5-minute closes (last LTP seen in each completed window = that candle's
+// close) and run standard Wilder RSI(14) over those. This means RSI only
+// becomes available once ~75 minutes of polling history has accumulated in
+// this browser - there's no way around that without a historical data API.
+const RSI_PERIOD = 14;
+const CANDLE_MS = 5 * 60 * 1000;
+
+function fiveMinClosesFor(symbol){
+  const hist = loadHistory().filter(h => h.symbol === symbol && h.ts && h.ltp !== null && h.ltp !== undefined);
+  if(!hist.length) return [];
+  hist.sort((a,b) => a.ts - b.ts);
+  const currentBucket = Math.floor(Date.now() / CANDLE_MS);
+  const buckets = new Map();
+  hist.forEach(h => {
+    const b = Math.floor(h.ts / CANDLE_MS);
+    if(b >= currentBucket) return;  // skip the still-forming candle
+    buckets.set(b, h.ltp);          // last write per bucket wins (history is sorted ascending)
+  });
+  return [...buckets.keys()].sort((a,b) => a-b).map(k => buckets.get(k));
+}
+
+function wilderRSI(closes, period = RSI_PERIOD){
+  if(closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for(let i = 1; i <= period; i++){
+    const diff = closes[i] - closes[i-1];
+    if(diff >= 0) gains += diff; else losses += -diff;
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  for(let i = period + 1; i < closes.length; i++){
+    const diff = closes[i] - closes[i-1];
+    const gain = diff > 0 ? diff : 0, loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+  if(avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+function rsiInfoFor(symbol){
+  const closes = fiveMinClosesFor(symbol);
+  const needed = RSI_PERIOD + 1;
+  return { rsi: wilderRSI(closes), have: closes.length, needed };
+}
+
+function rsiColor(v){
+  if(v === null || v === undefined || isNaN(v)) return 'rgb(124,135,152)';
+  if(v >= 70) return 'rgb(211,58,75)';   // overbought - red
+  if(v <= 30) return 'rgb(61,220,151)';  // oversold - green
+  return 'rgb(124,135,152)';
+}
+
+// ---------- Tape speed approximation ----------
+// There's no true trade-by-trade tape (per-print timestamps, sizes, and
+// buy/sell tags) exposed by this SDK - only periodic snapshots. This
+// approximates the 3 signals from what those snapshots actually give us:
+//   - print frequency: no trade COUNT is available, so it's estimated as
+//     (volume traded between two polls) / (last_traded_quantity at the time)
+//     - i.e. "how many prints of about that size would explain this much
+//     volume". Approximate by construction, not a real count.
+//   - print size: last_traded_quantity itself, sampled at each poll -
+//     genuinely the size of whichever single print happened to be the most
+//     recent one at that instant (not every print, since a lot can happen
+//     between two 5s polls in a liquid name).
+//   - aggressor ratio: classifies each interval's volume delta as
+//     buyer- or seller-initiated using the standard quote rule (LTP at/above
+//     best ask = buy, at/below best bid = sell), falling back to the tick
+//     rule (LTP up vs down since the last poll) when it printed inside the
+//     spread. This is the standard academic proxy (Lee & Ready) when true
+//     aggressor tags aren't available - a reasonable approximation, not a
+//     certainty.
+const TAPE_CURRENT_WINDOW_MS = 30 * 1000;   // "is it speeding up right now"
+const TAPE_TRAILING_WINDOW_MS = 5 * 60 * 1000; // baseline to compare against, per your spec
+
+function tapeIntervalsFor(symbol, windowMs){
+  const cutoff = Date.now() - windowMs;
+  const hist = loadHistory()
+    .filter(h => h.symbol === symbol && h.ts && h.ts >= cutoff && h.ltp !== null && h.ltp !== undefined)
+    .sort((a,b) => a.ts - b.ts);
+
+  const intervals = [];
+  for(let i = 1; i < hist.length; i++){
+    const prev = hist[i-1], curr = hist[i];
+    const dtSec = (curr.ts - prev.ts) / 1000;
+    if(dtSec <= 0) continue;
+    const volDelta = (curr.volume !== null && curr.volume !== undefined && prev.volume !== null && prev.volume !== undefined)
+      ? Math.max(0, curr.volume - prev.volume)   // guard against a day rollover/reset
+      : 0;
+
+    let side = null; // 'buy' | 'sell' | null (unclassifiable)
+    if(curr.ltp !== null && curr.best_ask !== null && curr.best_ask !== undefined && curr.ltp >= curr.best_ask) side = 'buy';
+    else if(curr.ltp !== null && curr.best_bid !== null && curr.best_bid !== undefined && curr.ltp <= curr.best_bid) side = 'sell';
+    else if(curr.ltp > prev.ltp) side = 'buy';
+    else if(curr.ltp < prev.ltp) side = 'sell';
+
+    intervals.push({ dtSec, volDelta, side, ltq: curr.ltq });
+  }
+  return intervals;
+}
+
+function summarizeTape(intervals){
+  let durationSec = 0, buyVol = 0, sellVol = 0, approxTradeCount = 0;
+  const sizes = [];
+  intervals.forEach(iv => {
+    durationSec += iv.dtSec;
+    if(iv.side === 'buy') buyVol += iv.volDelta;
+    else if(iv.side === 'sell') sellVol += iv.volDelta;
+    if(iv.ltq){
+      sizes.push(iv.ltq);
+      if(iv.volDelta > 0) approxTradeCount += iv.volDelta / Math.max(iv.ltq, 1);
+    }
+  });
+  const tpm = durationSec > 0 ? approxTradeCount / (durationSec / 60) : null;
+  const avgSize = sizes.length ? sizes.reduce((a,b)=>a+b,0) / sizes.length : null;
+  const aggressorRatio = (buyVol + sellVol) > 0 ? buyVol / (buyVol + sellVol) : null;
+  return { tpm, avgSize, aggressorRatio, tradedVolume: buyVol + sellVol, durationSec };
+}
+
+function tapeSpeedFor(symbol){
+  const current = summarizeTape(tapeIntervalsFor(symbol, TAPE_CURRENT_WINDOW_MS));
+  const trailing = summarizeTape(tapeIntervalsFor(symbol, TAPE_TRAILING_WINDOW_MS));
+
+  if(trailing.durationSec < 60 || trailing.tradedVolume <= 0){
+    // Not enough trailing history/activity yet to form a meaningful baseline.
+    return { score: null, tpmRatio: null, sizeRatio: null, aggressorRatio: null, warmingUp: true };
+  }
+
+  const tpmRatio = (current.tpm !== null && trailing.tpm) ? current.tpm / trailing.tpm : null;
+  const sizeRatio = (current.avgSize !== null && trailing.avgSize) ? current.avgSize / trailing.avgSize : null;
+  const aggressorRatio = current.aggressorRatio;
+
+  const hasEnough = tpmRatio !== null && sizeRatio !== null && aggressorRatio !== null;
+  const score = hasEnough ? tpmRatio * sizeRatio * aggressorRatio : null;
+
+  return { score, tpmRatio, sizeRatio, aggressorRatio, warmingUp: false };
+}
+
+function tapeColor(score){
+  if(score === null || score === undefined || isNaN(score)) return 'rgb(124,135,152)';
+  // Note: because aggressor_ratio is a 0-1 fraction (not centered at 1 like
+  // the other two ratios), a perfectly flat/balanced tape naturally scores
+  // ~0.5, not ~1.0 - confirmed against a synthetic no-signal baseline before
+  // shipping this. Thresholds are set relative to that ~0.5 baseline rather
+  // than to 1.0, so "quiet but balanced" doesn't read as "decelerating".
+  if(score >= 1.0) return 'rgb(61,220,151)';   // clearly accelerating (buy-side) - green
+  if(score <= 0.15) return 'rgb(211,58,75)';   // both quiet AND sell-dominant - red
+  return 'rgb(124,135,152)';
+}
+
 async function pollOnce(){
   if(!instruments.length){
     document.getElementById('poll-status').textContent = 'no instruments loaded';
@@ -343,8 +506,13 @@ async function pollOnce(){
     }
     lastCards = data.cards;
     renderCards(lastCards);
-    const now = new Date().toLocaleTimeString();
-    saveHistory(data.cards.map(c => ({time: now, symbol: c.symbol, ltp: c.ltp, total_bid_qty: c.total_bid_qty, total_ask_qty: c.total_ask_qty, clv: c.clv})));
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toLocaleTimeString();
+    saveHistory(data.cards.map(c => ({
+      time: now, ts: nowMs, symbol: c.symbol, ltp: c.ltp,
+      total_bid_qty: c.total_bid_qty, total_ask_qty: c.total_ask_qty, clv: c.clv,
+      ltq: c.ltq, volume: c.volume, best_bid: c.best_bid, best_ask: c.best_ask,
+    })));
     renderHistorySymbolOptions();
     renderHistoryTable();
     document.getElementById('poll-status').textContent = `updated ${now}`;
@@ -357,7 +525,11 @@ function renderCards(cards){
   const wrap = document.getElementById('cards');
   wrap.innerHTML = '';
 
-  let list = cards;
+  // Attach RSI + tape speed (both derived from our own polled history) fresh
+  // on every render, since they're cheap and need to reflect whatever's
+  // newest in localStorage.
+  let list = cards.map(c => ({...c, ...rsiInfoFor(c.symbol), tape: tapeSpeedFor(c.symbol)}));
+
   if(clvFilterHigh || clvFilterLow){
     list = list.filter(c => {
       const v = c.clv;
@@ -365,8 +537,12 @@ function renderCards(cards){
       return (clvFilterHigh && v > 0.8) || (clvFilterLow && v < 0.2);
     });
   }
-  if(clvSortActive){
+  if(sortMode === 'clv'){
     list = [...list].sort((a,b) => (b.clv ?? -1) - (a.clv ?? -1));   // highest close-location first, missing values last
+  } else if(sortMode === 'rsi'){
+    list = [...list].sort((a,b) => (b.rsi ?? -1) - (a.rsi ?? -1));   // highest RSI first, missing values last
+  } else if(sortMode === 'tape'){
+    list = [...list].sort((a,b) => (b.tape.score ?? -1) - (a.tape.score ?? -1));   // fastest tape first, missing values last
   }
 
   document.getElementById('filter-count-badge').textContent =
@@ -382,6 +558,13 @@ function renderCards(cards){
     // away from 0.5, colored per its position on the gradient.
     const fillLeft = v >= 0.5 ? 50 : v * 100;
     const fillWidth = Math.abs(v - 0.5) * 100;
+    const hasRsi = c.rsi !== null && c.rsi !== undefined;
+    const rsiText = hasRsi ? c.rsi.toFixed(1) : `warming up (${c.have}/${c.needed} candles)`;
+    const tapeText = c.tape.warmingUp ? 'warming up (need ~5m history)'
+      : (c.tape.score !== null ? `${c.tape.score.toFixed(2)}×` : 'no recent prints');
+    const tapeTitle = c.tape.score !== null
+      ? `freq ${c.tape.tpmRatio?.toFixed(2)}× · size ${c.tape.sizeRatio?.toFixed(2)}× · buy-side ${(c.tape.aggressorRatio*100).toFixed(0)}%`
+      : '';
     const div = document.createElement('div');
     div.className = 'qcard';
     div.innerHTML = `
@@ -391,6 +574,8 @@ function renderCards(cards){
         <div class="clv-fill" style="left:${fillLeft}%;width:${fillWidth}%;background:${color}"></div>
       </div>
       <div class="clv-label"><span>Close Location</span><span class="clv-value mono" style="color:${color}">${hasClv ? c.clv.toFixed(2) : '—'}</span></div>
+      <div class="clv-label"><span>RSI(14, 5m)</span><span class="clv-value mono" style="color:${rsiColor(c.rsi)}">${rsiText}</span></div>
+      <div class="clv-label" title="${tapeTitle}"><span>Tape Speed</span><span class="clv-value mono" style="color:${tapeColor(c.tape.score)}">${tapeText}</span></div>
       <div class="totals">
         <span class="b">Bid ${fmt(bid)}<span class="pct">${fmtPct(c.total_bid_pct)}</span></span>
         <span class="a">Ask ${fmt(ask)}<span class="pct">${fmtPct(c.total_ask_pct)}</span></span>
@@ -401,12 +586,34 @@ function renderCards(cards){
 }
 
 document.getElementById('sort-clv-btn').addEventListener('click', ()=>{
-  clvSortActive = !clvSortActive;
-  const btn = document.getElementById('sort-clv-btn');
-  btn.classList.toggle('active', clvSortActive);
-  btn.textContent = clvSortActive ? 'Sorted by Close Location (highest first)' : 'Sort by Close Location';
+  sortMode = sortMode === 'clv' ? 'none' : 'clv';
+  updateSortButtons();
   renderCards(lastCards);
 });
+
+document.getElementById('sort-rsi-btn').addEventListener('click', ()=>{
+  sortMode = sortMode === 'rsi' ? 'none' : 'rsi';
+  updateSortButtons();
+  renderCards(lastCards);
+});
+
+document.getElementById('sort-tape-btn').addEventListener('click', ()=>{
+  sortMode = sortMode === 'tape' ? 'none' : 'tape';
+  updateSortButtons();
+  renderCards(lastCards);
+});
+
+function updateSortButtons(){
+  const clvBtn = document.getElementById('sort-clv-btn');
+  const rsiBtn = document.getElementById('sort-rsi-btn');
+  const tapeBtn = document.getElementById('sort-tape-btn');
+  clvBtn.classList.toggle('active', sortMode === 'clv');
+  clvBtn.textContent = sortMode === 'clv' ? 'Sorted by Close Location (highest first)' : 'Sort by Close Location';
+  rsiBtn.classList.toggle('active', sortMode === 'rsi');
+  rsiBtn.textContent = sortMode === 'rsi' ? 'Sorted by RSI (highest first)' : 'Sort by RSI';
+  tapeBtn.classList.toggle('active', sortMode === 'tape');
+  tapeBtn.textContent = sortMode === 'tape' ? 'Sorted by Tape Speed (fastest first)' : 'Sort by Tape Speed';
+}
 
 document.getElementById('filter-high-btn').addEventListener('click', ()=>{
   clvFilterHigh = !clvFilterHigh;

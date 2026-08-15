@@ -156,6 +156,42 @@ def _extract_ohlc(quote):
     return high, low
 
 
+def _extract_tape_fields(quote):
+    """
+    Fields needed to approximate "tape speed" client-side (print frequency,
+    print size, aggressor ratio), confirmed against a real payload sample:
+      last_traded_quantity - size of the single most recent print
+      last_volume           - cumulative day volume (diff between polls ~=
+                               volume traded in that interval)
+      depth.buy[0]/sell[0]  - top-of-book bid/ask, used to classify prints as
+                               buyer- or seller-initiated (quote rule)
+    There's no true trade-by-trade tape (individual prints with timestamps)
+    exposed by this SDK - this is the closest derivable approximation from
+    periodic snapshots.
+    """
+    ltq, volume, best_bid, best_ask = None, None, None, None
+
+    for k in ("last_traded_quantity", "ltq", "lastTradedQuantity"):
+        if k in quote:
+            ltq = _to_num(quote[k])
+            break
+    for k in ("last_volume", "volume", "vol", "totalTradedVolume"):
+        if k in quote:
+            volume = _to_num(quote[k])
+            break
+
+    depth = quote.get("depth")
+    if isinstance(depth, dict):
+        buy_levels = depth.get("buy") or []
+        sell_levels = depth.get("sell") or []
+        if buy_levels:
+            best_bid = _to_num(buy_levels[0].get("price"))
+        if sell_levels:
+            best_ask = _to_num(sell_levels[0].get("price"))
+
+    return ltq, volume, best_bid, best_ask
+
+
 def _compute_clv(ltp, high, low):
     """
     Close Location Value: where the current price sits within today's
@@ -408,6 +444,7 @@ def _handle_quotes(form):
         total_bid, total_ask, ltp = _extract_totals(q)
         high, low = _extract_ohlc(q)
         clv = _compute_clv(ltp, high, low)
+        ltq, volume, best_bid, best_ask = _extract_tape_fields(q)
 
         qty_total = (total_bid or 0) + (total_ask or 0)
         bid_pct = round((total_bid or 0) / qty_total * 100, 1) if qty_total else None
@@ -424,6 +461,10 @@ def _handle_quotes(form):
             "day_high": high,
             "day_low": low,
             "clv": clv,
+            "ltq": ltq,
+            "volume": volume,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
         })
 
     return 200, {"ok": True, "cards": cards}
